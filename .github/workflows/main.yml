@@ -10,7 +10,6 @@ jobs:
 
     steps:
 
-      # 1. Enable Windows Remote Desktop
       - name: Enable RDP
         shell: powershell
         run: |
@@ -24,7 +23,6 @@ jobs:
 
           Restart-Service TermService -Force
 
-      # 2. Create RDP user
       - name: Create RDP User
         shell: powershell
         run: |
@@ -61,119 +59,196 @@ jobs:
           "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
           "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      # 3. Install Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
-      # 4. Download WebRDP
       - name: Download WebRDP
         shell: powershell
         run: |
           git clone https://github.com/Mikej81/WebRDP.git
-          cd WebRDP
+
+          Set-Location WebRDP
+
           npm install
+
           npm run build
 
-      # 5. Start WebRDP
       - name: Start WebRDP
         shell: powershell
         run: |
-          cd WebRDP
-
-          $env:RDP_HOST = "127.0.0.1"
-          $env:RDP_PORT = "3389"
+          Set-Location WebRDP
 
           Start-Process `
-            powershell `
-            -ArgumentList "-NoProfile -Command `"node app.js`"" `
-            -WorkingDirectory (Get-Location)
-
-          Start-Sleep -Seconds 10
-
-      # 6. Download cloudflared
-      - name: Install Cloudflare Tunnel
-        shell: powershell
-        run: |
-          $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-
-          Invoke-WebRequest `
-            -Uri $url `
-            -OutFile "$env:TEMP\cloudflared.exe"
-
-      # 7. Start Cloudflare Quick Tunnel
-      - name: Start Cloudflare Quick Tunnel
-        shell: powershell
-        run: |
-
-          $log = "$env:TEMP\cloudflared.log"
-
-          Start-Process `
-            -FilePath "$env:TEMP\cloudflared.exe" `
-            -ArgumentList "tunnel --url http://localhost:4200 --no-autoupdate" `
-            -RedirectStandardOutput $log `
-            -RedirectStandardError "$env:TEMP\cloudflared-error.log" `
+            -FilePath "node.exe" `
+            -ArgumentList "app.js" `
+            -WorkingDirectory (Get-Location) `
             -WindowStyle Hidden
 
-          Write-Host "Waiting for Cloudflare Tunnel..."
+          Write-Host "Waiting for WebRDP..."
 
-          $url = $null
+          $ready = $false
 
           for ($i = 1; $i -le 30; $i++) {
 
             Start-Sleep -Seconds 2
 
-            if (Test-Path $log) {
+            try {
+              $response = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:4200/" `
+                -UseBasicParsing `
+                -TimeoutSec 5
 
-              $content = Get-Content $log -Raw
-
-              $match = [regex]::Match(
-                $content,
-                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-              )
-
-              if ($match.Success) {
-                $url = $match.Value
+              if ($response.StatusCode -ge 200) {
+                $ready = $true
                 break
               }
+
+            } catch {
+              Write-Host "WebRDP not ready yet..."
             }
           }
 
-          if (-not $url) {
-            Write-Host "Cloudflare log:"
-            if (Test-Path $log) {
-              Get-Content $log
-            }
+          if (-not $ready) {
+            Write-Error "WebRDP failed to start."
 
-            Write-Error "Cloudflare Quick Tunnel URL was not found."
+            Get-Process node -ErrorAction SilentlyContinue
+
             exit 1
           }
 
-          "WEB_RDP_URL=$url" >> $env:GITHUB_ENV
+          Write-Host "WebRDP is running on port 4200."
 
-      # 8. Show connection information
-      - name: Show RDP Information
+      - name: Download Cloudflared
+        shell: powershell
+        run: |
+          $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+
+          $path = "$env:RUNNER_TEMP\cloudflared.exe"
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $path
+
+          & $path --version
+
+      - name: Start Cloudflare Quick Tunnel
+        shell: powershell
+        run: |
+
+          $cloudflared = "$env:RUNNER_TEMP\cloudflared.exe"
+
+          $metricsPort = 55555
+
+          $logFile = "$env:RUNNER_TEMP\cloudflared.log"
+
+          $errorFile = "$env:RUNNER_TEMP\cloudflared-error.log"
+
+          Write-Host "Starting Cloudflare Quick Tunnel..."
+
+          Start-Process `
+            -FilePath $cloudflared `
+            -ArgumentList @(
+              "tunnel",
+              "--no-autoupdate",
+              "--metrics",
+              "127.0.0.1:$metricsPort",
+              "--url",
+              "http://127.0.0.1:4200"
+            ) `
+            -RedirectStandardOutput $logFile `
+            -RedirectStandardError $errorFile `
+            -WindowStyle Hidden
+
+          Write-Host "Waiting for Cloudflare..."
+
+          $hostname = $null
+
+          for ($i = 1; $i -le 60; $i++) {
+
+            Start-Sleep -Seconds 2
+
+            try {
+
+              $result = Invoke-RestMethod `
+                -Uri "http://127.0.0.1:$metricsPort/quicktunnel" `
+                -TimeoutSec 3
+
+              if ($result.hostname) {
+
+                $hostname = $result.hostname
+
+                Write-Host "Cloudflare hostname found:"
+                Write-Host $hostname
+
+                break
+              }
+
+            } catch {
+
+              Write-Host "Waiting for tunnel..."
+
+            }
+          }
+
+          if (-not $hostname) {
+
+            Write-Host ""
+            Write-Host "========== CLOUDFLARE OUTPUT =========="
+
+            if (Test-Path $logFile) {
+              Get-Content $logFile
+            }
+
+            if (Test-Path $errorFile) {
+              Get-Content $errorFile
+            }
+
+            Write-Host "========================================"
+
+            Write-Error "Cloudflare Quick Tunnel did not provide a hostname."
+
+            exit 1
+          }
+
+          "CLOUDFLARE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+
+      - name: Test WebRDP Through Localhost
+        shell: powershell
+        run: |
+
+          Write-Host "Testing WebRDP..."
+
+          $response = Invoke-WebRequest `
+            -Uri "http://127.0.0.1:4200/" `
+            -UseBasicParsing
+
+          Write-Host "WebRDP HTTP status:"
+          Write-Host $response.StatusCode
+
+      - name: Show Connection Information
         shell: powershell
         run: |
 
           Write-Host ""
           Write-Host "=============================================="
-          Write-Host "             WEB RDP IS READY"
+          Write-Host "              RDP IS READY"
           Write-Host "=============================================="
           Write-Host ""
           Write-Host "OPEN THIS URL:"
-          Write-Host "$env:WEB_RDP_URL/rdp/host/127.0.0.1"
+          Write-Host ""
+          Write-Host "https://$env:CLOUDFLARE_HOSTNAME/rdp/host/127.0.0.1"
           Write-Host ""
           Write-Host "USERNAME:"
-          Write-Host "$env:RDP_USERNAME"
+          Write-Host "RDP"
           Write-Host ""
           Write-Host "PASSWORD:"
           Write-Host "$env:RDP_PASSWORD"
           Write-Host ""
           Write-Host "=============================================="
+          Write-Host ""
 
-      # 9. Keep GitHub Runner alive
       - name: Keep RDP Alive
         shell: powershell
         run: |
