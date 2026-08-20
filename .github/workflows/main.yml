@@ -6,17 +6,17 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
 
-      # =========================
+      # ==========================================
       # 1. Enable Windows RDP
-      # =========================
+      # ==========================================
       - name: Enable RDP
         shell: powershell
         run: |
-          Write-Host "Enabling Windows Remote Desktop..."
+          Write-Host "Enabling Remote Desktop..."
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -27,34 +27,32 @@ jobs:
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "UserAuthentication" `
-            -Value 0 `
+            -Value 1 `
             -Force
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          Restart-Service -Name TermService -Force
+          Restart-Service TermService -Force
 
-          Write-Host ""
-          Write-Host "Checking RDP listener..."
-          netstat -ano | findstr ":3389"
+          Write-Host "RDP enabled."
 
-      # =========================
+      # ==========================================
       # 2. Create RDP User
-      # =========================
+      # ==========================================
       - name: Create RDP User
         shell: powershell
         run: |
           Write-Host "Creating RDP user..."
 
           $chars = (
-            [char[]]"ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
-            [char[]]"abcdefghijklmnopqrstuvwxyz" +
-            [char[]]"0123456789" +
-            [char[]]"!@#$%^&*_-+="
+            [char[]](65..90) +
+            [char[]](97..122) +
+            [char[]](48..57) +
+            [char[]](33..47)
           )
 
           $password = -join (
-            1..24 | ForEach-Object {
+            1..28 | ForEach-Object {
               $chars | Get-Random
             }
           )
@@ -64,14 +62,17 @@ jobs:
             -AsPlainText `
             -Force
 
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+          $existing = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+
+          if ($existing) {
             Remove-LocalUser -Name "RDP"
           }
 
           New-LocalUser `
             -Name "RDP" `
             -Password $securePassword `
-            -AccountNeverExpires
+            -AccountNeverExpires `
+            -PasswordNeverExpires
 
           Add-LocalGroupMember `
             -Group "Administrators" `
@@ -84,236 +85,126 @@ jobs:
           "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
           "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-          Write-Host "RDP user created successfully."
+          Write-Host "RDP user created."
 
-      # =========================
-      # 3. Download WebRDP
-      # =========================
+      # ==========================================
+      # 3. Verify RDP is listening
+      # ==========================================
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Write-Host "Checking RDP port..."
+
+          $ready = $false
+
+          for ($i = 1; $i -le 20; $i++) {
+
+            $connection = Get-NetTCPConnection `
+              -LocalPort 3389 `
+              -State Listen `
+              -ErrorAction SilentlyContinue
+
+            if ($connection) {
+              $ready = $true
+              break
+            }
+
+            Write-Host "Waiting for RDP..."
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $ready) {
+            Write-Error "RDP port 3389 is not listening."
+            exit 1
+          }
+
+          Write-Host "RDP port 3389 is listening."
+
+      # ==========================================
+      # 4. Clone WebRDP
+      # ==========================================
       - name: Download WebRDP
         shell: powershell
         run: |
-          Write-Host "Downloading WebRDP..."
-
-          if (Test-Path "WebRDP") {
-            Remove-Item "WebRDP" -Recurse -Force
-          }
-
           git clone https://github.com/Mikej81/WebRDP.git
 
-          if (-not (Test-Path "WebRDP")) {
-            Write-Error "WebRDP repository was not downloaded."
-            exit 1
-          }
-
-          Write-Host "WebRDP downloaded."
-
-      # =========================
-      # 4. Install Node.js
-      # =========================
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      # =========================
-      # 5. Install WebRDP dependencies
-      # =========================
-      - name: Install WebRDP
-        shell: powershell
-        run: |
           Set-Location WebRDP
-
-          Write-Host "Installing npm dependencies..."
 
           npm install
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "npm install failed."
-            exit 1
-          }
-
-          Write-Host "Building WebRDP..."
-
           npm run build
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "WebRDP build failed."
-            exit 1
-          }
-
-      # =========================
-      # 6. Start WebRDP
-      # =========================
+      # ==========================================
+      # 5. Start WebRDP
+      # ==========================================
       - name: Start WebRDP
         shell: powershell
         run: |
           Set-Location WebRDP
 
-          Write-Host "======================================"
-          Write-Host "Starting WebRDP"
-          Write-Host "======================================"
+          # WebRDP configuration
+          $env:LISTEN_IP = "0.0.0.0"
+          $env:LISTEN_PORT = "4200"
+          $env:RDP_DEFAULT_PORT = "3389"
+          $env:SESSION_SECRET = [guid]::NewGuid().ToString()
 
-          $logFile = "$env:GITHUB_WORKSPACE\webrdp.log"
+          Write-Host "Starting WebRDP..."
+          Write-Host "Listening on 0.0.0.0:4200"
 
-          if (Test-Path $logFile) {
-            Remove-Item $logFile -Force
-          }
-
-          # Start npm in background and capture EVERYTHING.
-          $process = Start-Process `
-            -FilePath "cmd.exe" `
-            -ArgumentList "/c npm start > `"$logFile`" 2>&1" `
-            -WorkingDirectory "$env:GITHUB_WORKSPACE\WebRDP" `
-            -PassThru `
+          Start-Process `
+            -FilePath "node" `
+            -ArgumentList "app.js" `
+            -RedirectStandardOutput "$env:TEMP\webrdp-out.log" `
+            -RedirectStandardError "$env:TEMP\webrdp-error.log" `
             -WindowStyle Hidden
 
-          "WEBRDP_PID=$($process.Id)" >> $env:GITHUB_ENV
-          "WEBRDP_LOG=$logFile" >> $env:GITHUB_ENV
-
-          Write-Host "WebRDP process started."
-          Write-Host "PID: $($process.Id)"
-          Write-Host "Log: $logFile"
-
-          Start-Sleep -Seconds 5
-
-          Write-Host ""
-          Write-Host "========== WebRDP LOG =========="
-          
-          if (Test-Path $logFile) {
-            Get-Content $logFile -Tail 100
-          }
-          else {
-            Write-Host "Log file does not exist yet."
-          }
-
-          Write-Host "================================"
-
-      # =========================
-      # 7. Diagnose WebRDP
-      # =========================
-      - name: Diagnose WebRDP
-        shell: powershell
-        run: |
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "WebRDP diagnostic information"
-          Write-Host "======================================"
-
-          Write-Host ""
-          Write-Host "Running Node processes:"
-          Get-Process node -ErrorAction SilentlyContinue |
-            Select-Object Id, ProcessName, CPU, StartTime
-
-          Write-Host ""
-          Write-Host "Listening TCP ports:"
-          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-            Sort-Object LocalPort |
-            Select-Object LocalAddress, LocalPort, OwningProcess
-
-          Write-Host ""
-          Write-Host "WebRDP log:"
-          
-          if (Test-Path "$env:WEBRDP_LOG") {
-            Get-Content "$env:WEBRDP_LOG" -Tail 200
-          }
-          else {
-            Write-Host "No WebRDP log found."
-          }
-
-      # =========================
-      # 8. Wait for WebRDP
-      # =========================
-      - name: Wait for WebRDP
-        shell: powershell
-        run: |
-          Write-Host "Waiting for WebRDP..."
-
-          $foundPort = $false
+          $ready = $false
 
           for ($i = 1; $i -le 30; $i++) {
 
-            Write-Host ""
-            Write-Host "Check $i/30"
-
-            if (Test-Path "$env:WEBRDP_LOG") {
-              Write-Host "----- LOG -----"
-              Get-Content "$env:WEBRDP_LOG" -Tail 30
-              Write-Host "---------------"
-            }
-
-            $listeners = Get-NetTCPConnection `
+            $connection = Get-NetTCPConnection `
+              -LocalPort 4200 `
               -State Listen `
               -ErrorAction SilentlyContinue
 
-            if ($listeners) {
-              Write-Host "Listening ports:"
-              $listeners |
-                Sort-Object LocalPort |
-                Select-Object LocalAddress, LocalPort, OwningProcess |
-                Format-Table
-            }
-
-            # Check common WebRDP ports.
-            foreach ($port in @(3000, 3001, 5173, 8080, 8000, 8888)) {
-
-              $test = Test-NetConnection `
-                -ComputerName "127.0.0.1" `
-                -Port $port `
-                -WarningAction SilentlyContinue
-
-              if ($test.TcpTestSucceeded) {
-                Write-Host "WebRDP appears to be listening on port $port"
-                "WEBRDP_PORT=$port" >> $env:GITHUB_ENV
-                $foundPort = $true
-                break
-              }
-            }
-
-            if ($foundPort) {
+            if ($connection) {
+              $ready = $true
               break
             }
 
+            Write-Host "WebRDP not ready yet..."
             Start-Sleep -Seconds 2
           }
 
-          if (-not $foundPort) {
-            Write-Host ""
-            Write-Host "======================================"
-            Write-Host "WebRDP FAILED TO START"
-            Write-Host "======================================"
+          if (-not $ready) {
 
-            if (Test-Path "$env:WEBRDP_LOG") {
-              Write-Host ""
-              Write-Host "========== FULL WEBRDP LOG =========="
-              Get-Content "$env:WEBRDP_LOG"
-              Write-Host "======================================"
+            Write-Host "========== WebRDP STDOUT =========="
+            if (Test-Path "$env:TEMP\webrdp-out.log") {
+              Get-Content "$env:TEMP\webrdp-out.log"
             }
 
-            Write-Host ""
-            Write-Host "========== NODE PROCESSES =========="
-            Get-Process node -ErrorAction SilentlyContinue |
-              Select-Object Id, ProcessName, CPU, StartTime
+            Write-Host "========== WebRDP STDERR =========="
+            if (Test-Path "$env:TEMP\webrdp-error.log") {
+              Get-Content "$env:TEMP\webrdp-error.log"
+            }
 
-            Write-Host ""
-            Write-Host "========== LISTENING PORTS =========="
-            netstat -ano
-
+            Write-Error "WebRDP failed to start."
             exit 1
           }
 
-          Write-Host ""
-          Write-Host "WebRDP is ready."
+          Write-Host "WebRDP is listening on port 4200."
 
-      # =========================
-      # 9. Download Cloudflared
-      # =========================
+      # ==========================================
+      # 6. Download Cloudflared
+      # ==========================================
       - name: Install Cloudflared
         shell: powershell
         run: |
-          Write-Host "Downloading cloudflared..."
-
           $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+
           $path = "$env:RUNNER_TEMP\cloudflared.exe"
+
+          Write-Host "Downloading cloudflared..."
 
           Invoke-WebRequest `
             -Uri $url `
@@ -326,112 +217,124 @@ jobs:
 
           & $path --version
 
-          "CLOUDFLARED=$path" >> $env:GITHUB_ENV
+          "CLOUDFLARED_PATH=$path" >> $env:GITHUB_ENV
 
-      # =========================
-      # 10. Start Cloudflare Tunnel
-      # =========================
+      # ==========================================
+      # 7. Start Cloudflare Quick Tunnel
+      # ==========================================
       - name: Start Cloudflare Tunnel
         shell: powershell
         run: |
-          Write-Host "Starting Cloudflare Quick Tunnel..."
+          $cloudflared = $env:CLOUDFLARED_PATH
 
-          $log = "$env:GITHUB_WORKSPACE\cloudflared.log"
+          $log = "$env:RUNNER_TEMP\cloudflared.log"
 
           if (Test-Path $log) {
             Remove-Item $log -Force
           }
 
-          $port = $env:WEBRDP_PORT
+          Write-Host "Starting Cloudflare Quick Tunnel..."
+          Write-Host "Target: http://127.0.0.1:4200"
 
-          Write-Host "Using WebRDP port: $port"
-
-          $process = Start-Process `
-            -FilePath $env:CLOUDFLARED `
-            -ArgumentList "tunnel --url http://127.0.0.1:$port" `
+          Start-Process `
+            -FilePath $cloudflared `
+            -ArgumentList "tunnel --no-autoupdate --url http://127.0.0.1:4200" `
             -RedirectStandardOutput $log `
             -RedirectStandardError $log `
-            -PassThru `
             -WindowStyle Hidden
 
-          "CLOUDFLARED_PID=$($process.Id)" >> $env:GITHUB_ENV
-          "CLOUDFLARED_LOG=$log" >> $env:GITHUB_ENV
+          $publicUrl = $null
 
-          Write-Host "Cloudflared PID: $($process.Id)"
+          for ($i = 1; $i -le 60; $i++) {
 
-      # =========================
-      # 11. Get Public URL
-      # =========================
-      - name: Get Public URL
-        shell: powershell
-        run: |
-          Write-Host "Waiting for Cloudflare Tunnel..."
+            Start-Sleep -Seconds 2
 
-          $url = $null
+            if (Test-Path $log) {
 
-          for ($i = 1; $i -le 30; $i++) {
-
-            Write-Host "Tunnel check $i/30"
-
-            if (Test-Path "$env:CLOUDFLARED_LOG") {
-
-              $content = Get-Content "$env:CLOUDFLARED_LOG" -Raw
+              $content = Get-Content $log -Raw -ErrorAction SilentlyContinue
 
               if ($content) {
 
-                Write-Host "Cloudflared output:"
-                Write-Host $content
+                Write-Host "Cloudflare is starting..."
 
                 $match = [regex]::Match(
                   $content,
-                  'https://[a-zA-Z0-9\-]+\.trycloudflare\.com'
+                  'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
                 )
 
                 if ($match.Success) {
-                  $url = $match.Value
+                  $publicUrl = $match.Value
                   break
                 }
               }
             }
 
-            Start-Sleep -Seconds 2
+            Write-Host "Waiting for Cloudflare Tunnel..."
           }
 
-          if (-not $url) {
+          if (-not $publicUrl) {
 
-            Write-Host ""
-            Write-Host "======================================"
-            Write-Host "Cloudflare Tunnel failed"
-            Write-Host "======================================"
+            Write-Host "========== CLOUDFLARED LOG =========="
 
-            if (Test-Path "$env:CLOUDFLARED_LOG") {
-              Get-Content "$env:CLOUDFLARED_LOG"
+            if (Test-Path $log) {
+              Get-Content $log
             }
 
+            Write-Error "Could not obtain Cloudflare Quick Tunnel URL."
             exit 1
           }
 
-          "PUBLIC_URL=$url" >> $env:GITHUB_ENV
+          "PUBLIC_URL=$publicUrl" >> $env:GITHUB_ENV
 
           Write-Host ""
-          Write-Host "======================================"
-          Write-Host "WEB RDP URL"
-          Write-Host "$url"
-          Write-Host "======================================"
+          Write-Host "=========================================="
+          Write-Host "       CLOUDFLARE TUNNEL READY"
+          Write-Host "=========================================="
+          Write-Host "URL:"
+          Write-Host "$publicUrl"
+          Write-Host "=========================================="
 
-      # =========================
-      # 12. Display Credentials
-      # =========================
+      # ==========================================
+      # 8. Test WebRDP locally
+      # ==========================================
+      - name: Verify WebRDP HTTP
+        shell: powershell
+        run: |
+          Write-Host "Testing WebRDP..."
+
+          try {
+
+            $response = Invoke-WebRequest `
+              -Uri "http://127.0.0.1:4200/" `
+              -UseBasicParsing `
+              -TimeoutSec 15
+
+            Write-Host "WebRDP HTTP status: $($response.StatusCode)"
+
+          } catch {
+
+            Write-Host "WebRDP returned an HTTP error:"
+            Write-Host $_
+          }
+
+          Write-Host ""
+          Write-Host "WebRDP URL:"
+          Write-Host "$env:PUBLIC_URL/rdp/host/127.0.0.1"
+
+      # ==========================================
+      # 9. Show Login Information
+      # ==========================================
       - name: Show RDP Information
         shell: powershell
         run: |
           Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "              WEB RDP ACCESS"
-          Write-Host "=============================================="
+          Write-Host "=================================================="
+          Write-Host "              WEB RDP READY"
+          Write-Host "=================================================="
           Write-Host ""
-          Write-Host "WEB URL:"
-          Write-Host "$env:PUBLIC_URL"
+          Write-Host "OPEN THIS URL:"
+          Write-Host ""
+          Write-Host "$env:PUBLIC_URL/rdp/host/127.0.0.1"
           Write-Host ""
           Write-Host "USERNAME:"
           Write-Host "$env:RDP_USERNAME"
@@ -439,34 +342,24 @@ jobs:
           Write-Host "PASSWORD:"
           Write-Host "$env:RDP_PASSWORD"
           Write-Host ""
-          Write-Host "=============================================="
+          Write-Host "=================================================="
+          Write-Host "KEEP THIS ACTION RUNNING."
+          Write-Host "=================================================="
+          Write-Host ""
 
-      # =========================
-      # 13. Keep Runner Alive
-      # =========================
+      # ==========================================
+      # 10. Keep Runner Alive
+      # ==========================================
       - name: Keep RDP Alive
         shell: powershell
         run: |
           Write-Host ""
-          Write-Host "RDP / WebRDP is running."
-          Write-Host "Do not stop this workflow while using the session."
+          Write-Host "RDP SESSION IS ACTIVE"
           Write-Host ""
 
           while ($true) {
 
-            Write-Host "[$(Get-Date)] RDP Active"
-
-            if (Test-Path "$env:WEBRDP_LOG") {
-              Write-Host ""
-              Write-Host "Latest WebRDP output:"
-              Get-Content "$env:WEBRDP_LOG" -Tail 10
-            }
-
-            if (Test-Path "$env:CLOUDFLARED_LOG") {
-              Write-Host ""
-              Write-Host "Latest Cloudflare output:"
-              Get-Content "$env:CLOUDFLARED_LOG" -Tail 10
-            }
+            Write-Host "[$(Get-Date)] RDP + WebRDP + Cloudflare Tunnel active"
 
             Start-Sleep -Seconds 300
           }
