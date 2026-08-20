@@ -8,69 +8,179 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
 
-    permissions:
-      id-token: write
-
     steps:
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          audience: ${{ secrets.TS_AUDIENCE }}
-          tags: tag:ci
 
+      # 1. Enable Windows Remote Desktop
       - name: Enable RDP
         shell: powershell
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
           Restart-Service TermService -Force
 
+      # 2. Create RDP user
       - name: Create RDP User
         shell: powershell
         run: |
-          $password = -join ((33..126) | Get-Random -Count 24 | ForEach-Object {[char]$_})
-          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          $chars = (
+            (65..90) +
+            (97..122) +
+            (48..57)
+          )
 
-          New-LocalUser -Name "RDP" `
+          $password = -join (
+            1..24 | ForEach-Object {
+              [char]($chars | Get-Random)
+            }
+          )
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          New-LocalUser `
+            -Name "RDP" `
             -Password $securePassword `
             -AccountNeverExpires
 
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP"
 
           "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
           "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: Get Tailscale IP
+      # 3. Install Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 4. Download WebRDP
+      - name: Download WebRDP
         shell: powershell
         run: |
-          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          git clone https://github.com/Mikej81/WebRDP.git
+          cd WebRDP
+          npm install
+          npm run build
 
-          if (-not $ip) {
-            Write-Error "Could not get Tailscale IP"
+      # 5. Start WebRDP
+      - name: Start WebRDP
+        shell: powershell
+        run: |
+          cd WebRDP
+
+          $env:RDP_HOST = "127.0.0.1"
+          $env:RDP_PORT = "3389"
+
+          Start-Process `
+            powershell `
+            -ArgumentList "-NoProfile -Command `"node app.js`"" `
+            -WorkingDirectory (Get-Location)
+
+          Start-Sleep -Seconds 10
+
+      # 6. Download cloudflared
+      - name: Install Cloudflare Tunnel
+        shell: powershell
+        run: |
+          $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile "$env:TEMP\cloudflared.exe"
+
+      # 7. Start Cloudflare Quick Tunnel
+      - name: Start Cloudflare Quick Tunnel
+        shell: powershell
+        run: |
+
+          $log = "$env:TEMP\cloudflared.log"
+
+          Start-Process `
+            -FilePath "$env:TEMP\cloudflared.exe" `
+            -ArgumentList "tunnel --url http://localhost:4200 --no-autoupdate" `
+            -RedirectStandardOutput $log `
+            -RedirectStandardError "$env:TEMP\cloudflared-error.log" `
+            -WindowStyle Hidden
+
+          Write-Host "Waiting for Cloudflare Tunnel..."
+
+          $url = $null
+
+          for ($i = 1; $i -le 30; $i++) {
+
+            Start-Sleep -Seconds 2
+
+            if (Test-Path $log) {
+
+              $content = Get-Content $log -Raw
+
+              $match = [regex]::Match(
+                $content,
+                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+              )
+
+              if ($match.Success) {
+                $url = $match.Value
+                break
+              }
+            }
+          }
+
+          if (-not $url) {
+            Write-Host "Cloudflare log:"
+            if (Test-Path $log) {
+              Get-Content $log
+            }
+
+            Write-Error "Cloudflare Quick Tunnel URL was not found."
             exit 1
           }
 
-          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          "WEB_RDP_URL=$url" >> $env:GITHUB_ENV
 
+      # 8. Show connection information
       - name: Show RDP Information
         shell: powershell
         run: |
-          Write-Host ""
-          Write-Host "=============================="
-          Write-Host "RDP ADDRESS: $env:TAILSCALE_IP"
-          Write-Host "USERNAME:    $env:RDP_USERNAME"
-          Write-Host "PASSWORD:    $env:RDP_PASSWORD"
-          Write-Host "=============================="
-          Write-Host ""
 
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "             WEB RDP IS READY"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "OPEN THIS URL:"
+          Write-Host "$env:WEB_RDP_URL/rdp/host/127.0.0.1"
+          Write-Host ""
+          Write-Host "USERNAME:"
+          Write-Host "$env:RDP_USERNAME"
+          Write-Host ""
+          Write-Host "PASSWORD:"
+          Write-Host "$env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "=============================================="
+
+      # 9. Keep GitHub Runner alive
       - name: Keep RDP Alive
         shell: powershell
         run: |
+
           while ($true) {
+
             Write-Host "RDP is active: $(Get-Date)"
+
             Start-Sleep -Seconds 300
           }
