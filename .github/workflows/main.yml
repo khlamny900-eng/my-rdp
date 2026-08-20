@@ -1,0 +1,76 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Restart-Service TermService -Force
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $password = -join ((33..126) | Get-Random -Count 24 | ForEach-Object {[char]$_})
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" `
+            -Password $securePassword `
+            -AccountNeverExpires
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+
+          if (-not $ip) {
+            Write-Error "Could not get Tailscale IP"
+            exit 1
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Show RDP Information
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "RDP ADDRESS: $env:TAILSCALE_IP"
+          Write-Host "USERNAME:    $env:RDP_USERNAME"
+          Write-Host "PASSWORD:    $env:RDP_PASSWORD"
+          Write-Host "=============================="
+          Write-Host ""
+
+      - name: Keep RDP Alive
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "RDP is active: $(Get-Date)"
+            Start-Sleep -Seconds 300
+          }
